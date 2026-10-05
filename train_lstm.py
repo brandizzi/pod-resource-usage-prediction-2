@@ -5,7 +5,7 @@ Follows the LSTM forecasters of Dixit et al. 2022, NimbusGuard 2026 (2 layers
 of 32 and 16 units) and the LSTM baseline of Dang-Quang & Yoo 2021: the last
 ``--window`` rows of a pod go through two stacked LSTM layers, and the last
 hidden state feeds a dense output trained with MSE. The target is
-``future_max`` from common.py (max busy threads over the next 10 minutes).
+``future_max`` from common.py (max busy threads over the forecast horizon).
 
 Several variants (target scale and sample weighting) are trained with early
 stopping on validation average precision of saturation; the variant with the

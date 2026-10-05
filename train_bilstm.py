@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Bi-LSTM forecast of the maximum busy Tomcat threads over the next 10 minutes.
+"""Bi-LSTM forecast of the maximum busy Tomcat threads over the forecast horizon.
 
 Follows Dang-Quang & Yoo (2021), "Deep Learning-Based Autoscaling Using
 Bidirectional LSTM for Kubernetes": a window of the last 10 rows, one

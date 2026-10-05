@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Quantile regression forest forecast of Tomcat busy threads over the next 10 minutes.
+"""Quantile regression forest forecast of Tomcat busy threads over the forecast horizon.
 
 Each sample row t of a pod is described by lag features of the last 15 rows
 (busy threads, requests and CPU per step), rolling statistics, longer-range
@@ -10,7 +10,7 @@ RandomForestQuantileRegressor (as in AHPA, Zhou et al. 2023) is fitted to
 (uniform sampling, subsampling quiet rows, additionally oversampling
 saturated targets); the configuration and the predicted quantile (or mean)
 used as forecast and alarm score are chosen by validation average precision
-of saturation. Results are written by ``common.evaluate`` to results/qrf/.
+of saturation. Results are written by ``common.evaluate`` to results/h<N>min/qrf/.
 """
 
 import argparse

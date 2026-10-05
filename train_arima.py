@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Univariate ARIMA forecast of the maximum busy Tomcat threads over the next 10 minutes.
+"""Univariate ARIMA forecast of the maximum busy Tomcat threads over the forecast horizon.
 
 One global set of ARIMA(p,d,q) parameters is fitted by maximum likelihood
 (statsmodels SARIMAX, Kalman filter) on a random sample of long training-period
