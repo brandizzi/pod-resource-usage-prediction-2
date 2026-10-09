@@ -16,7 +16,7 @@ import pandas as pd
 
 import common
 
-MODELS = ["bilstm", "lstm", "arima", "qrf", "baseline_reactive", "baseline_recent_max"]
+MODELS = ["bilstm", "lstm", "arima", "qrf", "efc", "baseline_reactive", "baseline_recent_max"]
 
 
 def main():
