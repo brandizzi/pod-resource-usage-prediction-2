@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Bi-LSTM forecast of the maximum busy Tomcat threads over the forecast horizon.
+"""Bi-LSTM forecast of the maximum of the target (see common.py) over the forecast horizon.
 
 Follows Dang-Quang & Yoo (2021), "Deep Learning-Based Autoscaling Using
 Bidirectional LSTM for Kubernetes": a window of the last 10 rows, one
@@ -9,9 +9,10 @@ with train statistics, up to 50 epochs with early stopping (patience 5) on
 the validation loss.
 
 Several variants are trained and the one with the best validation average
-precision of saturation is evaluated on test with ``common.evaluate``:
+precision of reaching the threshold is evaluated on test with
+``common.evaluate``:
 
-- paper: univariate busy threads, target future_max / 200.
+- paper: univariate target series, target future_max / common.CAP.
 - multi: multivariate inputs (busy threads, requests, CPU, heap, nonheap,
   time of day/week, log1p(step_in_segment)) and a log1p target.
 - multi_weighted: as multi, with samples whose target is at least
@@ -39,7 +40,7 @@ VARIANTS = {
 def build_features(df, multivariate):
     """Per-row model inputs. Heavy-tailed counts are log-scaled in the multivariate variant."""
     if not multivariate:
-        return pd.DataFrame({"threads_busy": df["threads"]}).groupby(df["segment"]).ffill()
+        return pd.DataFrame({"target": df["target"]}).groupby(df["segment"]).ffill()
     ts = df["timestamp"]
     minute_of_day = ts.dt.hour * 60 + ts.dt.minute
     day_angle = 2 * np.pi * minute_of_day / 1440
@@ -95,16 +96,16 @@ def train_variant(name, cfg, df, splits, args, rng):
 
     future_max = df["future_max"].to_numpy()
     if cfg["log_target"]:
-        scale = np.log1p(common.SATURATION)
+        scale = np.log1p(common.CAP)
         y = (np.log1p(np.nan_to_num(future_max)) / scale).astype(np.float32)
-        to_threads = lambda p: np.expm1(np.clip(p, 0, None) * scale)
+        decode = lambda p: np.expm1(np.clip(p, 0, None) * scale)
     else:
-        y = (np.nan_to_num(future_max) / common.SATURATION).astype(np.float32)
-        to_threads = lambda p: p * common.SATURATION
+        y = (np.nan_to_num(future_max) / common.CAP).astype(np.float32)
+        decode = lambda p: p * common.CAP
     weight = np.where(cfg["weighted"] & (future_max >= args.high_threshold), args.high_weight, 1.0).astype(np.float32)
 
     train, val = splits["train"], splits["val"]
-    val_label = future_max[val] >= common.SATURATION
+    val_label = future_max[val] >= common.THRESHOLD
     model = BiLSTM(X.shape[1], args.hidden)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     checkpoint = args.output_dir / f"model_{name}.pt"
@@ -125,7 +126,7 @@ def train_variant(name, cfg, df, splits, args, rng):
             total += loss.item() * len(batch)
         val_out = predict(model, X, val, args.window, args.batch_size * 8)
         val_loss = float(((val_out - y[val]) ** 2).mean())
-        val_ap = common._average_precision(val_label, to_threads(val_out))
+        val_ap = common._average_precision(val_label, decode(val_out))
         print(f"[{name}] epoch {epoch:2d}  train loss {total / len(order):.6f}  val loss {val_loss:.6f}  "
               f"val AP {val_ap:.4f}  ({time.time() - epoch_started:.0f}s)", flush=True)
         if val_loss < best_loss:
@@ -139,7 +140,7 @@ def train_variant(name, cfg, df, splits, args, rng):
     model.load_state_dict(torch.load(checkpoint))
     print(f"[{name}] best epoch {best_epoch}, val loss {best_loss:.6f}, val AP {best_ap:.4f}", flush=True)
     return {
-        "model": model, "X": X, "to_threads": to_threads, "val_ap": best_ap, "val_loss": best_loss,
+        "model": model, "X": X, "decode": decode, "val_ap": best_ap, "val_loss": best_loss,
         "best_epoch": best_epoch, "epochs_run": epoch, "train_seconds": time.time() - started,
     }
 
@@ -154,7 +155,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--high-threshold", type=float, default=100, help="target from which samples are up-weighted")
+    parser.add_argument("--high-threshold", type=float, default=common.HIGH_LEVEL,
+                        help="target from which samples are up-weighted")
     parser.add_argument("--high-weight", type=float, default=10)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -176,8 +178,8 @@ def main():
     best = max(results, key=lambda n: results[n]["val_ap"] or 0)
     r = results[best]
     print(f"chosen variant: {best} (val AP {r['val_ap']:.4f})", flush=True)
-    val_pred = r["to_threads"](predict(r["model"], r["X"], splits["val"], args.window, args.batch_size * 8))
-    test_pred = r["to_threads"](predict(r["model"], r["X"], splits["test"], args.window, args.batch_size * 8))
+    val_pred = r["decode"](predict(r["model"], r["X"], splits["val"], args.window, args.batch_size * 8))
+    test_pred = r["decode"](predict(r["model"], r["X"], splits["test"], args.window, args.batch_size * 8))
     extra = {
         "variant": best, **VARIANTS[best],
         "window": args.window, "hidden_per_direction": args.hidden, "layers": 1, "loss": "MSE",

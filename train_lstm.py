@@ -1,20 +1,21 @@
 #!/usr/bin/env python
-"""Train a stacked unidirectional LSTM that forecasts saturation of the Tomcat thread pool.
+"""Train a stacked unidirectional LSTM that forecasts the target (see common.py) reaching its threshold.
 
 Follows the LSTM forecasters of Dixit et al. 2022, NimbusGuard 2026 (2 layers
 of 32 and 16 units) and the LSTM baseline of Dang-Quang & Yoo 2021: the last
 ``--window`` rows of a pod go through two stacked LSTM layers, and the last
 hidden state feeds a dense output trained with MSE. The target is
-``future_max`` from common.py (max busy threads over the forecast horizon).
+``future_max`` from common.py (max of the target over the forecast horizon).
 
 Several variants (target scale and sample weighting) are trained with early
-stopping on validation average precision of saturation; the variant with the
-best validation average precision is scored on test with common.evaluate.
+stopping on validation average precision of reaching the threshold; the
+variant with the best validation average precision is scored on test with
+common.evaluate.
 
 Variants:
 - log: MSE on log1p(future_max).
 - log_weighted: as log, with sample weight ``--high-weight`` when future_max >= ``--high-from``.
-- linear: MSE on future_max / 200, which already emphasises high targets.
+- linear: MSE on future_max / common.CAP, which already emphasises high targets.
 """
 
 import argparse
@@ -72,11 +73,11 @@ class StackedLSTM(nn.Module):
 
 
 def encode_target(future_max, variant):
-    return future_max / common.SATURATION if variant == "linear" else np.log1p(future_max)
+    return future_max / common.CAP if variant == "linear" else np.log1p(future_max)
 
 
 def decode_target(output, variant):
-    return output * common.SATURATION if variant == "linear" else np.expm1(output)
+    return output * common.CAP if variant == "linear" else np.expm1(output)
 
 
 def predict(model, X, ends, window, batch_size, variant):
@@ -85,7 +86,7 @@ def predict(model, X, ends, window, batch_size, variant):
     with torch.no_grad():
         for i in range(0, len(ends), batch_size):
             out.append(model(torch.from_numpy(gather(X, ends[i : i + batch_size], window))).numpy())
-    return decode_target(np.concatenate(out).astype(np.float64), variant).clip(0, common.SATURATION)
+    return decode_target(np.concatenate(out).astype(np.float64), variant).clip(0, common.CAP)
 
 
 def average_precision(label, score):
@@ -103,7 +104,7 @@ def train_variant(variant, X, future_max, train_ends, val_ends, args, rng):
     weight = np.ones(len(future_max), np.float32)
     if variant == "log_weighted":
         weight[future_max >= args.high_from] = args.high_weight
-    val_label = future_max[val_ends] >= common.SATURATION
+    val_label = future_max[val_ends] >= common.THRESHOLD
 
     best = {"ap": -np.inf, "epoch": 0, "state": None, "val_pred": None}
     stale = 0
@@ -151,7 +152,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--patience", type=int, default=5, help="epochs without validation AP improvement before stopping")
-    parser.add_argument("--high-from", type=float, default=100, help="future_max from which log_weighted up-weights samples")
+    parser.add_argument("--high-from", type=float, default=common.HIGH_LEVEL,
+                        help="future_max from which log_weighted up-weights samples")
     parser.add_argument("--high-weight", type=float, default=20.0)
     parser.add_argument("--low-keep", type=float, default=1.0,
                         help="share of training samples with future_max < --high-from kept each run")
@@ -183,8 +185,8 @@ def main():
         train_ends = train_ends[~low | (rng.random(len(train_ends)) < args.low_keep)]
     val_ends = splits["val"]
     print(f"samples: train {len(train_ends)}, validation {len(val_ends)}, test {len(splits['test'])}; "
-          f"saturated train {(future_max[train_ends] >= common.SATURATION).sum()}, "
-          f"val {(future_max[val_ends] >= common.SATURATION).sum()}", flush=True)
+          f"positive train {(future_max[train_ends] >= common.THRESHOLD).sum()}, "
+          f"val {(future_max[val_ends] >= common.THRESHOLD).sum()}", flush=True)
 
     runs = {}
     for variant in variants:

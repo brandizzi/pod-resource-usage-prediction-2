@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Energy-based Flow Classifier (EFC) for saturation of the Tomcat thread pool.
+"""Energy-based Flow Classifier (EFC) for the target (see common.py) reaching its threshold.
 
 Follows Souza et al., "A Novel Open Set Energy-based Flow Classifier for
 Network Intrusion Detection" (arXiv 2109.11224), and the single-class EFC it
@@ -12,8 +12,9 @@ encoded bins, last bin of each feature as reference) and local fields h_i.
 The energy of a sample under a class model is
 H = -sum_{i<j} e_ij(a_i, a_j) - sum_i h_i(a_i); lower means more typical.
 
-The classes are "the pool saturates within the horizon" (future_max >= 200)
-and "it does not". Variants, chosen by validation average precision:
+The classes are "the target reaches common.THRESHOLD within the horizon"
+(called saturating below) and "it does not". Variants, chosen by validation
+average precision:
 
 - single_class: the original EFC, a model of non-saturating rows only;
   the alarm score is its energy (how anomalous the row is).
@@ -22,7 +23,7 @@ and "it does not". Variants, chosen by validation average precision:
   H_normal - H_saturating, a log-likelihood ratio up to a constant.
 - two_class_full: as two_class_capped, with all non-saturating rows.
 
-The score is mapped monotonically to 0..200 for common.evaluate, so MAE and
+The score is mapped monotonically to 0..common.CAP for common.evaluate, so MAE and
 RMSE are not meaningful for this model. The paper's own decision rule (lowest
 energy class, "suspicious" above that class's 95th percentile training
 energy) is also reported in the metrics' ``extra``.
@@ -100,7 +101,7 @@ class PottsModel:
 def to_prediction(score, reference):
     """Monotone map of scores into 0..200, scaled by the training score spread."""
     center, spread = np.median(reference), reference.std() or 1.0
-    return common.SATURATION * expit((score - center) / spread)
+    return common.CAP * expit((score - center) / spread)
 
 
 def paper_rule(energies, cutoffs, label):
@@ -132,7 +133,7 @@ def main():
     X, label = {}, {}
     for split, rows in splits.items():
         X[split], names = build_features(df, series, rows)
-        label[split] = df["future_max"].to_numpy()[rows] >= common.SATURATION
+        label[split] = df["future_max"].to_numpy()[rows] >= common.THRESHOLD
     edges = fit_bins(X["train"], args.bins)
     A = {split: discretize(x, edges) for split, x in X.items()}
     n_bins = np.array([len(e) + 1 for e in edges])

@@ -1,19 +1,21 @@
 #!/usr/bin/env python
-"""Univariate ARIMA forecast of the maximum busy Tomcat threads over the forecast horizon.
+"""Univariate ARIMA forecast of the maximum of the target over the forecast horizon.
 
+The target is the experiment's metric from common.py (busy threads or heap).
 One global set of ARIMA(p,d,q) parameters is fitted by maximum likelihood
 (statsmodels SARIMAX, Kalman filter) on a random sample of long training-period
 segments, concatenated with runs of missing values between them so that they
 barely influence each other. The order is chosen by AIC over a small grid,
-separately on the raw and the log1p scale of busy threads.
+separately on the raw and the log1p scale of the target.
 
 The AIC-best order of each scale and ARIMA(4,1,0) (Dang-Quang & Yoo 2021) are
 then compared on validation. For a sample row t, each segment is Kalman
 filtered once with the fixed parameters; the filtered state at t (which only
 uses rows <= t of that segment) gives the 1..H step forecast means and
 variances, and the score is max_h(mean_h + z * sd_h), transformed back to
-threads. The candidate model and z are chosen by validation average precision
-of saturation, and the test set is predicted only at the end.
+the target's unit. The candidate model and z are chosen by validation average
+precision of reaching the threshold, and the test set is predicted only at
+the end.
 """
 
 import argparse
@@ -38,9 +40,9 @@ PAPER_ORDER = (4, 1, 0)
 
 
 def fit_sample(df, min_length, rows, gap, rng):
-    """Busy threads of random long training-period segments, separated by `gap` NaNs."""
+    """Target of random long training-period segments, separated by `gap` NaNs."""
     train = df[df["timestamp"] < np.datetime64(common.TRAIN_END)]
-    groups = {s: g["threads"].to_numpy() for s, g in train.groupby("segment") if len(g) >= min_length}
+    groups = {s: g["target"].to_numpy() for s, g in train.groupby("segment") if len(g) >= min_length}
     parts, total = [], 0
     for s in rng.permutation(list(groups)):
         parts += [groups[s], np.full(gap, np.nan)]
@@ -66,7 +68,7 @@ def fit_order(y, order):
 def forecast_paths(df, rows, scale, order, params, horizon):
     """Mean and sd (model scale) of the 1..horizon step forecasts made at each row."""
     forward, _ = SCALES[scale]
-    y = forward(df["threads"].to_numpy(np.float64))
+    y = forward(df["target"].to_numpy(np.float64))
     segment = df["segment"].to_numpy()
     mean = np.empty((len(rows), horizon))
     sd = np.empty((len(rows), horizon))
@@ -102,7 +104,7 @@ def score(mean, sd, scale, z):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--name", default="arima", help="results go to results/<name>")
+    parser.add_argument("--name", default="arima", help="results go to common.RESULTS_DIR/<name>")
     parser.add_argument("--fit-rows", type=int, default=150_000, help="training rows used to fit the parameters")
     parser.add_argument("--min-segment", type=int, default=200, help="minimum length of a fitting segment")
     parser.add_argument("--gap", type=int, default=100, help="missing values between concatenated segments")
@@ -118,7 +120,7 @@ def main():
     df, splits = common.prepare()
     actual = df["future_max"].to_numpy()
     val_rows, test_rows = splits["val"], splits["test"]
-    val_label = actual[val_rows] >= common.SATURATION
+    val_label = actual[val_rows] >= common.THRESHOLD
     print({k: len(v) for k, v in splits.items()}, flush=True)
 
     raw, n_segments, n_obs = fit_sample(df, args.min_segment, args.fit_rows, args.gap, np.random.default_rng(args.seed))
@@ -153,7 +155,7 @@ def main():
         mean, sd = forecast_paths(df, val_rows, scale, order, params, common.HORIZON_STEPS)
         paths[scale, order] = mean, sd
         for z in z_grid:
-            pred = np.clip(score(mean, sd, scale, z), 0, common.SATURATION)
+            pred = np.clip(score(mean, sd, scale, z), 0, common.CAP)
             ap = common._average_precision(val_label, pred)
             mae = float(np.abs(pred - actual[val_rows]).mean())
             selection.append({"scale": scale, "order": list(order), "z": z, "val_average_precision": ap, "val_mae": mae})

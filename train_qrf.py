@@ -1,16 +1,18 @@
 #!/usr/bin/env python
-"""Quantile regression forest forecast of Tomcat busy threads over the forecast horizon.
+"""Quantile regression forest forecast of the target (see common.py) over the forecast horizon.
 
 Each sample row t of a pod is described by lag features of the last 15 rows
-(busy threads, requests and CPU per step), rolling statistics, longer-range
-maxima of busy threads within the segment, JVM memory, time of day/week and
-pod age, all computed only from rows <= t of the same segment. A
+(the target, requests and CPU per step, plus busy threads when they are not
+the target), rolling statistics, longer-range maxima of the target within the
+segment, JVM memory, time of day/week and pod age, all computed only from
+rows <= t of the same segment. A
 RandomForestQuantileRegressor (as in AHPA, Zhou et al. 2023) is fitted to
 ``future_max`` (see common.py). A few training configurations are tried
 (uniform sampling, subsampling quiet rows, additionally oversampling
-saturated targets); the configuration and the predicted quantile (or mean)
+positive targets); the configuration and the predicted quantile (or mean)
 used as forecast and alarm score are chosen by validation average precision
-of saturation. Results are written by ``common.evaluate`` to results/h<N>min/qrf/.
+of reaching the threshold. Results are written by ``common.evaluate`` to
+common.RESULTS_DIR/qrf/.
 """
 
 import argparse
@@ -28,26 +30,30 @@ CONFIGS = {
     "quiet_subsampled": {"quiet_frac": 0.25, "oversample": 1},
     "quiet_subsampled_sat_x4": {"quiet_frac": 0.25, "oversample": 4},
 }
-# Training rows whose recent and future busy threads stay below this are "quiet".
-QUIET_LEVEL = 20
+MEMORY_COLUMNS = {"heap_gib": "jvm_memory_used_bytes_heap", "nonheap_gib": "jvm_memory_used_bytes_nonheap"}
+
+
+def lag_signals():
+    """Series described by lags and rolling statistics."""
+    extra = ("threads",) if common.TARGET_COLUMN != common.THREADS_COLUMN else ()
+    return ("target", "requests", "cpu") + extra
 
 
 def base_series(df):
     """Per-row inputs, forward-filled within each segment. Heavy-tailed counts are log-scaled."""
-    series = pd.DataFrame(
-        {
-            "threads": df["threads"],
-            "requests": np.log1p(df["catalina_globalrequestprocessor_requestcount_diff"].clip(lower=0)),
-            "cpu": np.log1p(df["process_cpu_seconds_total_diff"].clip(lower=0)),
-            "heap_gib": df["jvm_memory_used_bytes_heap"] / 2**30,
-            "nonheap_gib": df["jvm_memory_used_bytes_nonheap"] / 2**30,
-        }
-    )
-    series = series.groupby(df["segment"]).ffill().fillna(0)
-    by_segment = series["threads"].groupby(df["segment"])
-    series["threads_max_1h"] = by_segment.transform(lambda s: s.rolling(30, min_periods=1).max())
-    series["threads_max_1d"] = by_segment.transform(lambda s: s.rolling(720, min_periods=1).max())
-    series["threads_max_segment"] = by_segment.cummax()
+    columns = {
+        "target": df["target"],
+        "requests": np.log1p(df["catalina_globalrequestprocessor_requestcount_diff"].clip(lower=0)),
+        "cpu": np.log1p(df["process_cpu_seconds_total_diff"].clip(lower=0)),
+    }
+    columns |= {name: df[col] / 2**30 for name, col in MEMORY_COLUMNS.items() if col != common.TARGET_COLUMN}
+    if "threads" in lag_signals():
+        columns["threads"] = df["threads"]
+    series = pd.DataFrame(columns).groupby(df["segment"]).ffill().fillna(0)
+    by_segment = series["target"].groupby(df["segment"])
+    series["target_max_1h"] = by_segment.transform(lambda s: s.rolling(30, min_periods=1).max())
+    series["target_max_1d"] = by_segment.transform(lambda s: s.rolling(720, min_periods=1).max())
+    series["target_max_segment"] = by_segment.cummax()
     return series
 
 
@@ -56,7 +62,7 @@ def build_features(df, series, rows):
     window = rows[:, None] + np.arange(1 - common.MIN_HISTORY, 1)
     steps = np.arange(common.MIN_HISTORY) - (common.MIN_HISTORY - 1) / 2
     f = {}
-    for name in ("threads", "requests", "cpu"):
+    for name in lag_signals():
         w = series[name].to_numpy(np.float32)[window]
         for lag in range(common.MIN_HISTORY):
             f[f"{name}_lag{lag}"] = w[:, -1 - lag]
@@ -68,11 +74,11 @@ def build_features(df, series, rows):
         f[f"{name}_delta1"] = w[:, -1] - w[:, -2]
         f[f"{name}_delta4"] = w[:, -1] - w[:, -5]
         f[f"{name}_slope15"] = (w * steps).sum(1) / (steps**2).sum()
-    for name in ("heap_gib", "nonheap_gib"):
+    for name in (n for n in MEMORY_COLUMNS if n in series):
         w = series[name].to_numpy(np.float32)[window]
         f[name] = w[:, -1]
         f[f"{name}_delta14"] = w[:, -1] - w[:, 0]
-    for name in ("threads_max_1h", "threads_max_1d", "threads_max_segment"):
+    for name in ("target_max_1h", "target_max_1d", "target_max_segment"):
         f[name] = series[name].to_numpy(np.float32)[rows]
     ts = df["timestamp"].iloc[rows]
     minute_of_day = (ts.dt.hour * 60 + ts.dt.minute).to_numpy()
@@ -86,12 +92,12 @@ def build_features(df, series, rows):
 
 
 def training_rows(X, y, names, quiet_frac, oversample, rng):
-    """Indices into the training matrix: quiet rows subsampled, saturated targets repeated."""
-    recent = X[:, names.index("threads_max15")]
-    quiet = (recent < QUIET_LEVEL) & (y < QUIET_LEVEL)
+    """Indices into the training matrix: quiet rows subsampled, positive targets repeated."""
+    recent = X[:, names.index("target_max15")]
+    quiet = (recent < common.LOW_LEVEL) & (y < common.LOW_LEVEL)
     keep = ~quiet | (rng.random(len(y)) < quiet_frac)
     idx = np.flatnonzero(keep)
-    saturated = idx[y[idx] >= common.SATURATION]
+    saturated = idx[y[idx] >= common.THRESHOLD]
     return np.concatenate([idx] + [saturated] * (oversample - 1))
 
 
@@ -128,7 +134,7 @@ def main():
     for split, rows in splits.items():
         X[split], names = build_features(df, series, rows)
     y = {split: df["future_max"].to_numpy()[rows] for split, rows in splits.items()}
-    val_label = y["val"] >= common.SATURATION
+    val_label = y["val"] >= common.THRESHOLD
     print(f"{len(names)} features; samples: " + ", ".join(f"{s} {len(r)}" for s, r in splits.items()), flush=True)
     print(f"features built in {time.time() - started:.0f}s", flush=True)
 
@@ -151,7 +157,7 @@ def main():
         val_pred = predict(model, X["val"], args.chunk)
         scores[config] = {k: average_precision(val_label, v) for k, v in val_pred.items()}
         print(
-            f"{config}: {len(idx)} training rows ({int((y['train'][idx] >= common.SATURATION).sum())} saturated), "
+            f"{config}: {len(idx)} training rows ({int((y['train'][idx] >= common.THRESHOLD).sum())} saturated), "
             f"fit {fit_seconds:.0f}s, validation predict {time.time() - t0:.0f}s, "
             f"validation MAE of median {np.abs(val_pred['q0.5'] - y['val']).mean():.3f}",
             flush=True,
@@ -175,7 +181,7 @@ def main():
         "config": best["config"],
         "output": best["output"],
         "hyperparams": {k: v for k, v in vars(args).items() if k not in ("configs", "chunk")} | CONFIGS[best["config"]]
-        | {"quiet_level": QUIET_LEVEL},
+        | {"quiet_level": common.LOW_LEVEL},
         "train_rows": best["train_rows"],
         "fit_seconds": round(best["fit_seconds"], 1),
         "total_seconds": round(time.time() - started, 1),
@@ -184,7 +190,7 @@ def main():
             "val": float(np.abs(best["val_pred"]["q0.5"] - y["val"]).mean()),
             "test": float(np.abs(test_pred["q0.5"] - y["test"]).mean()),
         },
-        "test_ap_all_outputs": {k: average_precision(y["test"] >= common.SATURATION, v) for k, v in test_pred.items()},
+        "test_ap_all_outputs": {k: average_precision(y["test"] >= common.THRESHOLD, v) for k, v in test_pred.items()},
         "top_feature_importances": importance.head(20).round(5).to_dict(),
     }
     common.evaluate("qrf", df, splits, best["val_pred"][best["output"]], test_pred[best["output"]], extra=extra)

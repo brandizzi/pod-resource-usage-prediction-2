@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """Rank the evaluated models on the test set.
 
-Reads results/h<N>min/<name>/metrics.json and predictions.npz written by
-common.evaluate() for the horizon set in HORIZON_MINUTES. Models are ranked by
-test average precision of "the pool saturates within the horizon"; 90%
-confidence intervals come from a bootstrap over test days, since saturations
-cluster in a few days.
+Reads <RESULTS_DIR>/<name>/metrics.json and predictions.npz written by
+common.evaluate() for the experiment and horizon set in EXPERIMENT and
+HORIZON_MINUTES. Models are ranked by test average precision of "the target
+reaches its threshold within the horizon"; 90% confidence intervals come from
+a bootstrap over test days, since threshold crossings cluster in a few days.
 """
 
 import argparse
@@ -28,7 +28,7 @@ def main():
 
     df, splits = common.prepare()
     rows = splits["test"]
-    label = df["future_max"].to_numpy()[rows] >= common.SATURATION
+    label = df["future_max"].to_numpy()[rows] >= common.THRESHOLD
     day = df["timestamp"].dt.floor("D").to_numpy()[rows]
     days, day_index = np.unique(day, return_inverse=True)
     members = [np.where(day_index == d)[0] for d in range(len(days))]
@@ -66,7 +66,8 @@ def main():
     out.index += 1
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", None)
-    print(f"horizon {common.HORIZON_MINUTES} min; test: {len(rows)} samples, {label.sum()} saturated, {len(days)} days\n")
+    print(f"{common.EXPERIMENT}, threshold {common.THRESHOLD:g}, horizon {common.HORIZON_MINUTES} min; "
+          f"test: {len(rows)} samples, {label.sum()} positive, {len(days)} days\n")
     print(out.round(3).to_string())
     out.to_csv(common.RESULTS_DIR / "model_ranking.csv", index_label="rank")
 
